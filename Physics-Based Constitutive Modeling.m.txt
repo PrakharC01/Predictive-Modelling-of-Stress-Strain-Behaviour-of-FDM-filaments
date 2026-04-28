@@ -1,0 +1,264 @@
+%% Ramberg-Osgood Constitutive Model — Full Computation from Raw Data
+%  Calibration : SUNLU PLA
+%  Target      : eSUN PLA+
+%
+%  R-O equation:  eps = sigma/E1 + alpha * (sigma/sigma_y)^(n-1)
+%
+%  Steps performed here:
+%   1. E1  via linear regression on elastic region (sigma < 15 MPa)
+%   2. E2, G12 from empirical FDM relations
+%   3. sigma_y via 0.2% offset method
+%   4. n via log-log regression of plastic strain vs stress (yield to UTS)
+%   5. alpha via median inversion: alpha = eps_p / (sigma/sigma_y)^(n-1)
+%   6. Predict eSUN strain up to its UTS using SUNLU constants
+%   7. Compute RMSE, MAE, peak strain error
+%   8. Plot stress-strain curves + error bar chart
+% -------------------------------------------------------------------------
+
+clear; clc; close all;
+
+%% ── 1. RAW DATA ──────────────────────────────────────────────────────────
+
+sunlu_strain = [0.000000; 0.055993; 0.111987; 0.167980; 0.223973; 0.279966; ...
+    0.335960; 0.391953; 0.447946; 0.503939; 0.559933; 0.615926; 0.671919; ...
+    0.727912; 0.783906; 0.839899; 0.895892; 0.951886; 1.007879; 1.063872; ...
+    1.119865; 1.175859; 1.231852; 1.287845; 1.343838; 1.399832; 1.455825; ...
+    1.511818; 1.567811; 1.623805; 1.679798; 1.735791; 1.791785; 1.847778; ...
+    1.903771; 1.959764; 2.015758; 2.071751; 2.127744; 2.183737; 2.239731; ...
+    2.295724; 2.351717; 2.407710; 2.463704; 2.519697; 2.575690; 2.631684; ...
+    2.687677; 2.743670; 2.799663; 2.855657; 2.911650; 2.967643];
+
+sunlu_stress = [0.679949; 2.466336; 4.108022; 5.629630; 7.052946; 8.397117; ...
+    9.678840; 10.912544; 12.110564; 13.283310; 14.439425; 15.585937; ...
+    16.728403; 17.871051; 19.016907; 20.167923; 21.325090; 22.488558; ...
+    23.657732; 24.831378; 26.007715; 27.184501; 28.359116; 29.528638; ...
+    30.689916; 31.839632; 32.974368; 34.090655; 35.185029; 36.254077; ...
+    37.294475; 38.303034; 39.276724; 40.212710; 41.108377; 41.961350; ...
+    42.769513; 43.531025; 44.244330; 44.908168; 45.521578; 46.083902; ...
+    46.594785; 47.054171; 47.462300; 47.819701; 48.127180; 48.385810; ...
+    48.596920; 48.762077; 48.883071; 48.961898; 49.000739; 49.001943];
+
+esun_strain = [0.000000; 0.054613; 0.109226; 0.163838; 0.218451; 0.273064; ...
+    0.327677; 0.382290; 0.436902; 0.491515; 0.546128; 0.600741; 0.655354; ...
+    0.709966; 0.764579; 0.819192; 0.873805; 0.928418; 0.983030; 1.037643; ...
+    1.092256; 1.146869; 1.201481; 1.256094; 1.310707; 1.365320; 1.419933; ...
+    1.474545; 1.529158; 1.583771; 1.638384; 1.692997; 1.747609; 1.802222; ...
+    1.856835; 1.911448; 1.966061; 2.020673; 2.075286; 2.129899; 2.184512; ...
+    2.239125; 2.293737; 2.348350; 2.402963; 2.457576; 2.512189; 2.566801; ...
+    2.621414; 2.676027; 2.730640; 2.785253; 2.839865; 2.894478];
+
+esun_stress = [0.791419; 2.573514; 4.223034; 5.762314; 7.211078; 8.586625; ...
+    9.904006; 11.176193; 12.414239; 13.627435; 14.823460; 16.008514; ...
+    17.187464; 18.363962; 19.540573; 20.718886; 21.899626; 23.082758; ...
+    24.267581; 25.452823; 26.636724; 27.817123; 28.991524; 30.157175; ...
+    31.311130; 32.450309; 33.571554; 34.671680; 35.747523; 36.795984; ...
+    37.814061; 38.798889; 39.747769; 40.658195; 41.527873; 42.354746; ...
+    43.137007; 43.873112; 44.561792; 45.202056; 45.793199; 46.334802; ...
+    46.826728; 47.269125; 47.662415; 48.007286; 48.304686; 48.555810; ...
+    48.762084; 48.925154; 49.046867; 49.129254; 49.174513; 49.184988];
+
+%% ── STEP 1: E1 via linear regression on elastic region (sigma < 15 MPa) ─
+
+elastic_mask = sunlu_stress < 15;
+s_el = sunlu_stress(elastic_mask);
+e_el = sunlu_strain(elastic_mask);
+
+% Regress stress on strain: stress = E1*strain + intercept
+% E1 is the slope
+p  = polyfit(e_el, s_el, 1);
+E1 = p(1);
+
+fprintf('STEP 1: E1 (Young''s modulus)\n');
+fprintf('  Elastic points used: %d  (sigma < 15 MPa)\n', sum(elastic_mask));
+fprintf('  E1 = %.4f MPa\n\n', E1);
+
+%% ── STEP 2: E2 and G12 from empirical FDM relations ─────────────────────
+
+nu12 = 0.36;
+E2   = 0.4 * E1;
+G12  = E1 / (2 * (1 + nu12));
+
+fprintf('STEP 2: Derived elastic constants\n');
+fprintf('  E2  = 0.4 x E1          = %.4f MPa\n', E2);
+fprintf('  G12 = E1/(2*(1+%.2f))  = %.4f MPa\n\n', nu12, G12);
+
+%% ── STEP 3: sigma_y via 0.2%% offset method ─────────────────────────────
+
+% Offset line: sigma_line = E1 * (strain - 0.002)
+sigma_line = E1 * (sunlu_strain - 0.002);
+
+% Find where the actual stress curve crosses the offset line from above
+diff_vec         = sunlu_stress - sigma_line;
+sign_change_idx  = find(diff(sign(diff_vec)) ~= 0, 1, 'first');
+
+% Linear interpolation at crossing
+frac    = diff_vec(sign_change_idx) / ...
+          (diff_vec(sign_change_idx) - diff_vec(sign_change_idx + 1));
+sigma_y = sunlu_stress(sign_change_idx) + ...
+          frac * (sunlu_stress(sign_change_idx+1) - sunlu_stress(sign_change_idx));
+strain_y = sunlu_strain(sign_change_idx) + ...
+           frac * (sunlu_strain(sign_change_idx+1) - sunlu_strain(sign_change_idx));
+
+fprintf('STEP 3: Yield strength (0.2%% offset)\n');
+fprintf('  Crossing between indices %d and %d\n', sign_change_idx, sign_change_idx+1);
+fprintf('  sigma_y = %.4f MPa  at strain_y = %.4f mm/mm\n\n', sigma_y, strain_y);
+
+%% ── STEP 4: UTS of SUNLU ─────────────────────────────────────────────────
+
+[uts_sunlu, uts_idx_sunlu] = max(sunlu_stress);
+
+fprintf('STEP 4: SUNLU UTS\n');
+fprintf('  UTS = %.4f MPa at index %d\n\n', uts_sunlu, uts_idx_sunlu);
+
+%% ── STEP 5: n via log-log regression (yield -> UTS) ─────────────────────
+
+yield_idx   = sign_change_idx;
+plastic_idx = yield_idx : uts_idx_sunlu;
+
+s_p   = sunlu_stress(plastic_idx);
+e_p   = sunlu_strain(plastic_idx);
+eps_p = e_p - (s_p / E1);       % plastic strain = total - elastic
+
+% Keep only positive plastic strain values (required for log)
+valid = eps_p > 0;
+s_p   = s_p(valid);
+eps_p = eps_p(valid);
+
+% log(eps_p) = n * log(sigma) + const  =>  slope = n
+pn = polyfit(log(s_p), log(eps_p), 1);
+n  = pn(1);
+
+fprintf('STEP 5: Strain hardening exponent n\n');
+fprintf('  Points used in log-log regression: %d\n', sum(valid));
+fprintf('  n = %.4f  =>  n-1 = %.4f  (exponent in R-O)\n\n', n, n-1);
+
+%% ── STEP 6: alpha via median inversion ───────────────────────────────────
+
+% From R-O: eps_p = alpha * (sigma/sigma_y)^(n-1)
+% => alpha = eps_p / (sigma/sigma_y)^(n-1)
+alpha_vals = eps_p ./ (s_p / sigma_y).^(n - 1);
+alpha      = median(alpha_vals);
+
+fprintf('STEP 6: Alpha (yield offset coefficient)\n');
+fprintf('  alpha = median of %d point-wise inversions = %.6f\n\n', ...
+        length(alpha_vals), alpha);
+
+%% ── STEP 7: Predict eSUN PLA+ strain ────────────────────────────────────
+
+[uts_esun, uts_idx_esun] = max(esun_stress);
+
+% Only predict up to UTS (R-O not valid post-necking)
+esun_s_pred  = esun_stress(1:uts_idx_esun);
+esun_e_real  = esun_strain(1:uts_idx_esun);
+
+% Apply R-O equation: eps = sigma/E1 + alpha*(sigma/sigma_y)^(n-1)
+esun_e_pred  = esun_s_pred / E1 + alpha * (esun_s_pred / sigma_y).^(n - 1);
+
+fprintf('STEP 7: Prediction\n');
+fprintf('  Formula: eps = sigma/E1 + alpha*(sigma/sigma_y)^(n-1)\n');
+fprintf('  Predicted %d points up to eSUN UTS = %.4f MPa\n\n', ...
+        uts_idx_esun, uts_esun);
+
+%% ── STEP 8: Validation metrics ───────────────────────────────────────────
+
+rmse     = sqrt(mean((esun_e_pred - esun_e_real).^2));
+mae      = mean(abs(esun_e_pred - esun_e_real));
+peak_err = abs(esun_e_pred(end) - esun_e_real(end)) / esun_e_real(end) * 100;
+
+fprintf('STEP 8: Validation\n');
+fprintf('  RMSE              = %.4f mm/mm\n', rmse);
+fprintf('  MAE               = %.4f mm/mm\n', mae);
+fprintf('  Peak strain error = %.2f %%\n', peak_err);
+fprintf('  Predicted peak e  = %.4f mm/mm\n', esun_e_pred(end));
+fprintf('  Real peak e       = %.4f mm/mm\n\n', esun_e_real(end));
+
+fprintf('=== CONSTANTS SUMMARY ===\n');
+fprintf('  E1      = %.4f MPa\n', E1);
+fprintf('  E2      = %.4f MPa\n', E2);
+fprintf('  G12     = %.4f MPa\n', G12);
+fprintf('  sigma_y = %.4f MPa\n', sigma_y);
+fprintf('  n       = %.4f\n', n);
+fprintf('  n-1     = %.4f\n', n-1);
+fprintf('  alpha   = %.6f\n', alpha);
+fprintf('=========================\n\n');
+
+%% ── PLOT 1: Stress-Strain Curves ─────────────────────────────────────────
+
+c_amber  = [186/255, 117/255,  23/255];
+c_teal   = [ 15/255, 110/255,  86/255];
+c_purple = [127/255, 119/255, 221/255];
+
+figure('Name','Stress-Strain — SUNLU PLA to eSUN PLA+', ...
+       'Units','centimeters','Position',[2 2 18 12]);
+hold on; box on; grid on;
+set(gca,'GridLineStyle','--','GridAlpha',0.2,'FontSize',10,'FontName','Arial');
+
+h1 = plot(sunlu_strain, sunlu_stress, '-',  'Color', c_amber,  'LineWidth', 2.0);
+h2 = plot(esun_strain,  esun_stress,  '-',  'Color', c_teal,   'LineWidth', 2.0);
+h3 = plot(esun_e_pred,  esun_s_pred,  '--', 'Color', c_purple, 'LineWidth', 1.8);
+
+% UTS markers
+plot(sunlu_strain(uts_idx_sunlu), uts_sunlu, ...
+     'o','Color',c_amber, 'MarkerFaceColor',c_amber, 'MarkerSize',6);
+plot(esun_strain(uts_idx_esun),   uts_esun,  ...
+     'o','Color',c_teal,  'MarkerFaceColor',c_teal,  'MarkerSize',6);
+plot(esun_e_pred(end), uts_esun, ...
+     's','Color',c_purple,'MarkerFaceColor',c_purple,'MarkerSize',6);
+
+% Yield point on calibration curve
+plot(strain_y, sigma_y, '^', 'Color', c_amber, ...
+     'MarkerFaceColor','w','MarkerSize',7,'LineWidth',1.2);
+text(strain_y+0.04, sigma_y-2, ...
+     sprintf('\\sigma_y = %.1f MPa', sigma_y), ...
+     'Color',c_amber,'FontSize',8,'FontName','Arial');
+
+% Annotation box with computed (not hardcoded) values
+ann_str = { ...
+    '\bf Calibration constants — SUNLU PLA', ...
+    sprintf('E_1 = %.2f MPa    \\sigma_y = %.2f MPa', E1, sigma_y), ...
+    sprintf('n = %.3f    n\\minus1 = %.3f    \\alpha = %.5f', n, n-1, alpha), ...
+    '', ...
+    '\bf Prediction error — eSUN PLA+', ...
+    sprintf('RMSE = %.4f mm/mm    MAE = %.4f mm/mm', rmse, mae), ...
+    sprintf('Peak \\epsilon error = %.2f %%', peak_err)};
+annotation('textbox',[0.13 0.55 0.40 0.32], ...
+    'String',ann_str,'FitBoxToText','on', ...
+    'BackgroundColor',[0.97 0.97 0.97], ...
+    'EdgeColor',[0.75 0.75 0.75], ...
+    'FontSize',7.5,'FontName','Arial','LineWidth',0.5);
+
+xlabel('Strain \epsilon (mm/mm)','FontSize',11,'FontName','Arial');
+ylabel('Stress \sigma (MPa)',    'FontSize',11,'FontName','Arial');
+title({'Ramberg-Osgood Stress-Strain Transfer', ...
+       'SUNLU PLA (calibration) \rightarrow eSUN PLA+ (target)'}, ...
+      'FontSize',12,'FontName','Arial','FontWeight','bold');
+
+legend([h1 h2 h3], ...
+    {'SUNLU PLA — calibration (real)', ...
+     'eSUN PLA+ — target (real)', ...
+     'eSUN PLA+ — predicted  [\epsilon = \sigma/E_1 + \alpha(\sigma/\sigma_y)^{n-1}]'}, ...
+    'Location','southeast','FontSize',9,'FontName','Arial');
+
+xlim([0, 3.2]); ylim([0, 55]);
+hold off;
+
+%% ── PLOT 2: Point-by-point Absolute Error ────────────────────────────────
+
+abs_err = abs(esun_e_pred - esun_e_real);
+
+figure('Name','Absolute Prediction Error — eSUN PLA+', ...
+       'Units','centimeters','Position',[22 2 16 9]);
+bar(1:length(abs_err), abs_err, ...
+    'FaceColor',c_purple,'EdgeColor',[83/255 74/255 183/255],'LineWidth',0.5);
+hold on; box on; grid on;
+set(gca,'GridLineStyle','--','GridAlpha',0.2,'FontSize',10,'FontName','Arial');
+
+yline(mae,'--k',sprintf('MAE = %.4f mm/mm', mae), ...
+    'LineWidth',1.2,'FontSize',9,'LabelHorizontalAlignment','right');
+
+xlabel('Data point index','FontSize',11,'FontName','Arial');
+ylabel('|\epsilon_{pred} - \epsilon_{real}| (mm/mm)','FontSize',11,'FontName','Arial');
+title('Point-by-point absolute strain error — eSUN PLA+', ...
+      'FontSize',11,'FontName','Arial','FontWeight','bold');
+xlim([0, length(abs_err)+1]);
+hold off;
